@@ -2426,4 +2426,10 @@ impl PhotocraftApp {
         self.styled = false;
         self.fonts_ready = false;
     }
+
+    /// The user has answered the unsaved-documents question on quitting (Almanak asks the other
+    /// apps next).
+    pub fn close_allowed(&self) -> bool {
+        self.allow_close
+    }
 }

@@ -1,36 +1,38 @@
 //! Almanak: PhotoCraft, VectorCraft and DesignCraft as the Photo, Vector and Layout personas of
 //! one window, switched from the persona bar.
 //!
-//! Usage: `almanak [files…]`. Each file opens in the persona that edits its kind (`.psd`, `.png`
-//! → Photo; `.svg`, `.vectorcraft` → Vector; `.designcraft`, `.idml` → Layout).
+//! Usage: `almanak [options] [files…]`. Each file opens in the persona that edits its kind (`.psd`,
+//! `.png` → Photo; `.svg`, `.vectorcraft` → Vector; `.designcraft`, `.idml` → Layout).
 //!
-//! `--control <port>` starts each app's own JSON-lines control server, unchanged, so each app's
-//! MCP bridge and control docs apply: Photo on `port`, Vector on `port + 1`, Layout on `port + 2`.
-//! `--automation-read-root` / `--automation-write-root` name the folders agents may read and
-//! write (Photo; without them, no file access). Photo asks for a token (`--control-token-file <path>`, or one generated and printed). A request
-//! on a persona's port brings that persona to the front, so an agent sees what it drives.
+//! `--control <port>` starts a JSON-lines control channel per persona, each speaking that app's
+//! own protocol: Photo on `port`, Vector on `port + 1`, Layout on `port + 2`. All three ask for the
+//! same bearer token first (`{"method":"auth","params":{"token":…}}`; `--control-token-file
+//! <path>`, else one is generated and printed). `--automation-read-root` / `--automation-write-root`
+//! confine the files Photo and Vector agents may read and write (Photo: no file access without
+//! them); Layout's channel is not confined. A request on a persona's channel brings that persona to
+//! the front, so an agent sees what it drives. `almanak.switch {"persona": "photo"|"vector"|"layout"}`
+//! on any channel does what the persona bar does (StudioLink included) and replies with its status.
 //!
 //! The three apps share one egui context: only the active persona runs its frame, and switching
 //! re-installs its fonts and theme (`reinstall_style`), which the others replaced.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 mod studio;
 
+/// PhotoCraft's control server (token auth, request and reply limits) serves all three personas.
 #[path = "../../photocraft/apps/photocraft/src/control_server.rs"]
-mod photo_control;
-#[path = "../../vectorcraft/apps/vectorcraft/src/control_server.rs"]
-mod vector_control;
-#[path = "../../designcraft/apps/designcraft/src/control_server.rs"]
-mod layout_control;
+mod control_server;
 
-use photocraft_ui_egui::{FileDialogAnswer, FileDialogRequest, PhotocraftApp};
-use vectorcraft_ui_egui::VectorcraftApp;
 use designcraft_ui_egui::DesignApp;
+use photocraft_ui_egui::{FileDialogAnswer, FileDialogRequest, PhotocraftApp};
+use vectorcraft_engine::file_access;
+use vectorcraft_ui_egui::VectorcraftApp;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
 enum Persona {
     Photo,
     Vector,
@@ -39,14 +41,6 @@ enum Persona {
 
 impl Persona {
     const ALL: [Persona; 3] = [Persona::Photo, Persona::Vector, Persona::Layout];
-
-    fn label(self) -> &'static str {
-        match self {
-            Persona::Photo => "Photo",
-            Persona::Vector => "Vector",
-            Persona::Layout => "Layout",
-        }
-    }
 
     /// The persona that edits files like `path`; `None` when it's unknown (Photo opens most images).
     fn for_path(path: &str) -> Option<Persona> {
@@ -59,13 +53,17 @@ impl Persona {
     }
 }
 
-/// No persona asked for by the control channel.
-const NO_REQUEST: u8 = u8::MAX;
+/// Control requests waiting for each persona (indexed by `Persona as usize`): the persona's own
+/// frame takes them, and it only runs while that persona is in front.
+type Pending = Arc<[AtomicBool; 3]>;
+
+/// An `almanak.switch` request from the control channel: the persona, and where to reply.
+type SwitchRequest = Arc<std::sync::Mutex<Option<(Persona, std::sync::mpsc::Sender<serde_json::Value>)>>>;
 
 struct Almanak {
     active: Persona,
-    /// The persona a control request last arrived for (its index in [`Persona::ALL`]).
-    requested: Arc<AtomicU8>,
+    pending: Pending,
+    switch_request: SwitchRequest,
     photo: PhotocraftApp,
     vector: VectorcraftApp,
     layout: DesignApp,
@@ -73,21 +71,23 @@ struct Almanak {
     studio: studio::Studio,
     /// The last StudioLink message, shown on the persona bar.
     status: String,
+    /// Quitting is waiting on Layout's Save Changes question about this document (uid).
+    quitting_layout: Option<u64>,
 }
 
 /// The persona bar's height, in points.
 const BAR_HEIGHT: f32 = 26.0;
 
 impl Almanak {
-    fn switch(&mut self, to: Persona, ctx: &egui::Context) {
+    /// Bring `to` to the front. `user`: the persona bar, so StudioLink opens the selected graphic
+    /// in `to`; a control request or quitting only switches (and still writes edits back).
+    fn switch(&mut self, to: Persona, ctx: &egui::Context, user: bool) {
         if to == self.active {
             return;
         }
         let result = match (self.active, to) {
-            (Persona::Layout, _) => self.studio.edit_selected(to, &self.layout, &mut self.photo, &mut self.vector),
-            (_, Persona::Layout) => self.studio.write_back(&mut self.layout, &self.photo, &self.vector).map(|n| {
-                (n > 0).then(|| format!("Updated {n} graphic{} in the layout", if n == 1 { "" } else { "s" }))
-            }),
+            (Persona::Layout, _) if user => self.studio.edit_selected(to, &self.layout, &mut self.photo, &mut self.vector),
+            (_, Persona::Layout) => self.studio.write_back(&mut self.layout, &mut self.photo, &mut self.vector),
             _ => Ok(None),
         };
         match result {
@@ -113,11 +113,54 @@ impl Almanak {
                 self.photo.open_paths(&[path.to_string()]);
                 Ok(())
             }
-            Persona::Vector => vectorcraft_ui_egui::io::open_reporting(&mut self.vector, path).map(drop),
+            Persona::Vector => file_access::unconfined(|| vectorcraft_ui_egui::io::open_reporting(&mut self.vector, path).map(drop)),
             Persona::Layout => self.layout.open_file("file.open", serde_json::json!({ "path": path })).map(drop),
         };
         if let Err(e) = result {
             log::error!("{path}: {e}");
+        }
+    }
+
+    /// The window is asked to close: each persona with unsaved documents asks about them in turn,
+    /// in front (Photo and Vector with their own Save Changes questions, which close again when
+    /// answered; Layout one document at a time). Returns whether the close may go ahead.
+    fn may_close(&mut self, ctx: &egui::Context) -> bool {
+        // Edited graphics go into the layout first: then only the layout asks about them.
+        match self.studio.write_back(&mut self.layout, &mut self.photo, &mut self.vector) {
+            Ok(Some(msg)) => self.status = msg,
+            Ok(None) => {}
+            Err(e) => self.status = format!("Couldn't update the layout: {e}"),
+        }
+        let photo_unsaved = !self.photo.close_allowed() && self.photo.session.documents().iter().any(|d| d.is_dirty());
+        if photo_unsaved {
+            self.switch(Persona::Photo, ctx, false);
+            return true; // Photo's frame holds the close back and asks.
+        }
+        if self.vector.session.documents().iter().any(|d| d.is_dirty()) {
+            self.switch(Persona::Vector, ctx, false);
+            return true; // Vector's frame holds the close back and asks.
+        }
+        if let Some(d) = self.layout.session.documents().iter().position(|d| d.is_dirty()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.switch(Persona::Layout, ctx, false);
+            self.quitting_layout = self.layout.session.documents().get(d).map(|d| d.uid);
+            designcraft_ui_egui::menus::close_document(&mut self.layout, Some(d));
+            return false;
+        }
+        true
+    }
+
+    /// While quitting waits on Layout: once its question is answered, ask about the next unsaved
+    /// document, or close. Cancel (the document still unsaved) stops quitting.
+    fn continue_quit(&mut self, ctx: &egui::Context) {
+        let Some(uid) = self.quitting_layout else { return };
+        if self.layout.ui.dialog.is_some() {
+            return;
+        }
+        self.quitting_layout = None;
+        let cancelled = self.layout.session.documents().iter().any(|d| d.uid == uid && d.is_dirty());
+        if !cancelled {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
@@ -127,8 +170,8 @@ impl Almanak {
                 ui.strong("Almanak");
                 ui.separator();
                 for p in Persona::ALL {
-                    if ui.selectable_label(self.active == p, p.label()).clicked() {
-                        self.switch(p, ui.ctx());
+                    if ui.selectable_label(self.active == p, format!("{p:?}")).clicked() {
+                        self.switch(p, ui.ctx(), true);
                     }
                 }
                 if !self.status.is_empty() {
@@ -142,13 +185,31 @@ impl Almanak {
 
 impl eframe::App for Almanak {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        if let Some(&p) = Persona::ALL.get(self.requested.swap(NO_REQUEST, Ordering::Relaxed) as usize) {
-            self.switch(p, ctx);
+        // Control requests for a persona in the back: bring it forward so its frame takes them.
+        let waiting = |p: Persona| self.pending[p as usize].load(Ordering::Acquire);
+        if !waiting(self.active)
+            && let Some(p) = Persona::ALL.into_iter().find(|p| waiting(*p))
+        {
+            self.switch(p, ctx, false);
         }
+        let asked = self.switch_request.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        if let Some((p, reply)) = asked {
+            self.status.clear();
+            self.switch(p, ctx, true);
+            let _ = reply.send(serde_json::json!({"ok": true, "result": {"persona": format!("{:?}", self.active).to_lowercase(), "status": self.status}}));
+        }
+        if ctx.input(|i| i.viewport().close_requested()) && !self.may_close(ctx) {
+            return;
+        }
+        self.continue_quit(ctx);
+        // Cleared before the frame that takes them: a request arriving later sets it again.
+        self.pending[self.active as usize].store(false, Ordering::Release);
         // ponytail: only the active persona runs; background jobs of the others wait until shown.
         match self.active {
             Persona::Photo => eframe::App::logic(&mut self.photo, ctx, frame),
-            Persona::Vector => self.vector.logic(ctx),
+            // Vector confines what agents ask for to the automation roots; the person at the
+            // keyboard is not confined (as in VectorCraft's own shell).
+            Persona::Vector => file_access::unconfined(|| self.vector.logic(ctx)),
             Persona::Layout => self.layout.logic(ctx),
         }
     }
@@ -156,7 +217,7 @@ impl eframe::App for Almanak {
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
         match self.active {
             Persona::Photo => eframe::App::raw_input_hook(&mut self.photo, ctx, raw),
-            Persona::Vector => self.vector.raw_input_hook(raw),
+            Persona::Vector => file_access::unconfined(|| self.vector.raw_input_hook(raw)),
             Persona::Layout => self.layout.raw_input_hook(raw),
         }
     }
@@ -165,26 +226,106 @@ impl eframe::App for Almanak {
         self.persona_bar(ui);
         match self.active {
             Persona::Photo => eframe::App::ui(&mut self.photo, ui, frame),
-            Persona::Vector => self.vector.ui(ui),
+            Persona::Vector => file_access::unconfined(|| self.vector.ui(ui)),
             Persona::Layout => self.layout.ui(ui),
         }
     }
+
+    fn on_exit(&mut self) {
+        // Photo saves its preferences as they change (`Services::save_prefs`).
+        save_vector_prefs(&self.vector);
+        save_layout_prefs(&self.layout);
+    }
 }
 
-/// Hand requests from `rx` to the app through the returned receiver, asking for `persona` first.
-fn relay<T: Send + 'static>(rx: std::sync::mpsc::Receiver<T>, persona: Persona, requested: Arc<AtomicU8>, ctx: egui::Context) -> std::sync::mpsc::Receiver<T> {
+/// Hand control requests from `rx` to a persona through the returned receiver (as its own request
+/// type), marking it as waiting so it comes to the front. `almanak.switch` goes to Almanak.
+fn relay<T: Send + 'static>(
+    rx: std::sync::mpsc::Receiver<photocraft_ui_egui::ControlRequest>,
+    persona: Persona,
+    (pending, switch): (Pending, SwitchRequest),
+    ctx: egui::Context,
+    convert: fn(photocraft_ui_egui::ControlRequest) -> T,
+) -> std::sync::mpsc::Receiver<T> {
     let (tx, out) = std::sync::mpsc::channel();
-    let index = Persona::ALL.iter().position(|p| *p == persona).unwrap_or(0) as u8;
     std::thread::spawn(move || {
         for request in rx {
-            requested.store(index, Ordering::Relaxed);
-            if tx.send(request).is_err() {
+            if request.method == "almanak.switch" {
+                let to = match request.params.get("persona").and_then(serde_json::Value::as_str) {
+                    Some("photo") => Persona::Photo,
+                    Some("vector") => Persona::Vector,
+                    Some("layout") => Persona::Layout,
+                    _ => {
+                        let _ = request.reply.send(serde_json::json!({"ok": false, "error": "persona: photo, vector or layout"}));
+                        continue;
+                    }
+                };
+                *switch.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((to, request.reply));
+                ctx.request_repaint();
+                continue;
+            }
+            if tx.send(convert(request)).is_err() {
                 break;
             }
+            pending[persona as usize].store(true, Ordering::Release);
             ctx.request_repaint();
         }
     });
     out
+}
+
+/// Almanak's settings folder for `persona` (`$XDG_CONFIG_HOME/almanak/<persona>`, else
+/// `~/.config/almanak/<persona>`).
+fn config_dir(persona: &str) -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("almanak").join(persona))
+}
+
+/// Write `bytes` to `name` in `persona`'s settings folder; best effort (the old file stays on failure).
+fn write_setting(persona: &str, name: &str, bytes: &[u8]) -> Result<(), String> {
+    let dir = config_dir(persona).ok_or("no settings folder")?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    photocraft_format::atomic_write(&dir.join(name), bytes).map_err(|e| e.to_string())
+}
+
+fn read_setting(persona: &str, name: &str) -> Option<Vec<u8>> {
+    std::fs::read(config_dir(persona)?.join(name)).ok()
+}
+
+fn load_vector_prefs(app: &mut VectorcraftApp) {
+    if let Some(ui) = read_setting("vector", "ui.json").and_then(|b| serde_json::from_slice::<vectorcraft_ui_egui::UiState>(&b).ok()) {
+        app.ui = ui.sanitized();
+    }
+    vectorcraft_ui_egui::prefs_dialog::restore(app);
+}
+
+fn save_vector_prefs(app: &VectorcraftApp) {
+    let mut ui = app.ui.clone();
+    ui.engine_prefs = app.session.prefs.to_json();
+    if let Ok(bytes) = serde_json::to_vec_pretty(&ui) {
+        let _ = write_setting("vector", "ui.json", &bytes);
+    }
+}
+
+fn load_layout_prefs(app: &mut DesignApp) {
+    if let Some(ui) = read_setting("layout", "ui.json").and_then(|b| designcraft_ui_egui::UiState::from_preferences_json(&b).ok()) {
+        app.ui = ui;
+    }
+    if let Some(prefs) = read_setting("layout", "prefs.json").and_then(|b| serde_json::from_slice::<designcraft_engine::Prefs>(&b).ok()) {
+        app.session.prefs = prefs;
+    }
+}
+
+fn save_layout_prefs(app: &DesignApp) {
+    if let Ok(bytes) = serde_json::to_vec_pretty(&app.ui) {
+        let _ = write_setting("layout", "ui.json", &bytes);
+    }
+    if let Ok(bytes) = serde_json::to_vec_pretty(&app.session.prefs) {
+        let _ = write_setting("layout", "prefs.json", &bytes);
+    }
 }
 
 /// PhotoCraft's services; `automation` (the control channel's folders) lets agents read and write
@@ -283,7 +424,16 @@ fn photo_services(automation: Option<photocraft_automation::AuthorizedWorkspace>
             let img = Image::from_u8(w, h, ChannelLayout::Rgba, rgba.to_vec()).map_err(|e| e.to_string())?;
             photocraft_codecs::encode(&img, Format::Png, &EncodeOptions::default()).map_err(|e| e.to_string())
         })),
-        open_url: Some(Box::new(|url: &str| std::process::Command::new("xdg-open").arg(url).spawn().map(drop).map_err(|e| e.to_string()))),
+        // Only the web: the apps' own Help links. (An https:// URL can't read as an option, and
+        // xdg-open takes no `--`.)
+        open_url: Some(Box::new(|url: &str| {
+            if !url.starts_with("https://") {
+                return Err(format!("not a web address: {url}"));
+            }
+            std::process::Command::new("xdg-open").arg(url).spawn().map(drop).map_err(|e| e.to_string())
+        })),
+        load_prefs: Some(Box::new(|| read_setting("photo", "preferences.json").and_then(|b| String::from_utf8(b).ok()))),
+        save_prefs: Some(Box::new(|text: &str| write_setting("photo", "preferences.json", text.as_bytes()))),
         ..Default::default()
     }
 }
@@ -319,55 +469,64 @@ fn layout_services() -> designcraft_ui_egui::Services {
     }
 }
 
-fn main() -> eframe::Result {
-    let mut files = Vec::new();
-    let mut control_port: Option<u16> = None;
-    let mut token_file = None;
-    let (mut read_root, mut write_root) = (None, None);
-    let mut args = std::env::args().skip(1);
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "--control" => match args.next().and_then(|p| p.parse::<u16>().ok()).filter(|p| *p <= u16::MAX - 2) {
-                Some(p) => control_port = Some(p),
-                None => {
-                    eprintln!("almanak: --control needs a port number");
-                    std::process::exit(2);
-                }
-            },
-            "--control-token-file" => token_file = args.next().map(std::path::PathBuf::from),
-            "--automation-read-root" => read_root = args.next().map(std::path::PathBuf::from),
-            "--automation-write-root" => write_root = args.next().map(std::path::PathBuf::from),
-            _ => files.push(a),
+/// Report a usage error and stop.
+fn die(msg: impl std::fmt::Display) -> ! {
+    eprintln!("almanak: {msg}");
+    std::process::exit(2)
+}
+
+struct Args {
+    files: Vec<String>,
+    control_port: Option<u16>,
+    token_file: Option<PathBuf>,
+    read_root: Option<PathBuf>,
+    write_root: Option<PathBuf>,
+}
+
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
+    let mut a = Args { files: Vec::new(), control_port: None, token_file: None, read_root: None, write_root: None };
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        let mut value = || args.next().ok_or(format!("{arg} needs a value"));
+        match arg.as_str() {
+            // port + 2 must fit; below 1024 needs privileges (and 0 picks a random port).
+            "--control" => {
+                let v = value()?;
+                a.control_port = Some(v.parse::<u16>().ok().filter(|p| (1024..=u16::MAX - 2).contains(p)).ok_or(format!("--control: {v:?} is not a port from 1024 to 65533"))?);
+            }
+            "--control-token-file" => a.token_file = Some(value()?.into()),
+            "--automation-read-root" => a.read_root = Some(value()?.into()),
+            "--automation-write-root" => a.write_root = Some(value()?.into()),
+            "--" => a.files.extend(args.by_ref()),
+            s if s.starts_with("--") => return Err(format!("unknown option {s}")),
+            _ => a.files.push(arg),
         }
     }
-    // The folders agents may read and write through the control channel (none: no file access).
-    let workspace = match control_port.map(|_| photocraft_automation::AuthorizedWorkspace::new(read_root.as_deref(), write_root.as_deref())) {
-        Some(Ok(w)) => Some(w),
-        Some(Err(e)) => {
-            eprintln!("almanak: automation roots: {e}");
-            std::process::exit(2);
-        }
-        None => None,
+    Ok(a)
+}
+
+fn main() -> eframe::Result {
+    let Args { files, control_port, token_file, read_root, write_root } = parse_args(std::env::args().skip(1)).unwrap_or_else(|e| die(e));
+    // The folders agents may read and write through the control channels (none: no file access
+    // for Photo, nothing checked for Vector).
+    let (photo_roots, vector_roots) = match control_port {
+        Some(_) => (
+            Some(photocraft_automation::AuthorizedWorkspace::new(read_root.as_deref(), write_root.as_deref()).unwrap_or_else(|e| die(format!("automation roots: {e}")))),
+            file_access::AutomationRoots::new(read_root.as_deref(), write_root.as_deref()).unwrap_or_else(|e| die(format!("automation roots: {e}"))),
+        ),
+        None => (None, None),
     };
-    let photo_token = match control_port {
-        Some(_) => {
-            let (supplied, file) = photocraft_automation::security::token_inputs(None, token_file);
-            match photocraft_automation::security::server_token(supplied.as_deref(), file.as_deref()) {
-                Ok(token) => {
-                    match &file {
-                        Some(path) => eprintln!("almanak: Photo control token file: {}", path.display()),
-                        None => eprintln!("almanak: Photo control token: {token}"),
-                    }
-                    Some(token)
-                }
-                Err(e) => {
-                    eprintln!("almanak: control token: {e}");
-                    std::process::exit(2);
-                }
-            }
+    let token = control_port.map(|_| {
+        let (supplied, file) = photocraft_automation::security::token_inputs(None, token_file);
+        let token = photocraft_automation::security::server_token(supplied.as_deref(), file.as_deref()).unwrap_or_else(|e| die(format!("control token: {e}")));
+        match (&file, &supplied) {
+            (Some(path), _) => eprintln!("almanak: control token file: {}", path.display()),
+            (None, Some(_)) => eprintln!("almanak: using the supplied control token"),
+            // Generated for this run and kept nowhere else: the only way for a client to get it.
+            (None, None) => eprintln!("almanak: control token: {token}"),
         }
-        None => None,
-    };
+        token
+    });
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Almanak")
@@ -381,33 +540,44 @@ fn main() -> eframe::Result {
         "Almanak",
         options,
         Box::new(move |cc| {
-            let mut photo = PhotocraftApp::new(photocraft_engine::Session::new(), photo_services(workspace));
+            let mut photo = PhotocraftApp::new(photocraft_engine::Session::new(), photo_services(photo_roots));
             // Opens finish in the frame they start in, so StudioLink sees the opened document.
             photo.background_jobs = false;
             if let Some(rs) = cc.wgpu_render_state.clone() {
                 photo.set_wgpu(rs);
             }
             let mut vector = VectorcraftApp::new(vectorcraft_engine::Session::new(), vector_services());
+            load_vector_prefs(&mut vector);
             let mut layout = DesignApp::new(designcraft_engine::Session::new(), layout_services());
-            let requested = Arc::new(AtomicU8::new(NO_REQUEST));
-            if let (Some(port), Some(token)) = (control_port, photo_token) {
+            load_layout_prefs(&mut layout);
+            let pending: Pending = Arc::new([AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false)]);
+            let switch_request = SwitchRequest::default();
+            let shared = || (pending.clone(), switch_request.clone());
+            if let (Some(port), Some(token)) = (control_port, token) {
                 let ctx = &cc.egui_ctx;
-                let rx = photo_control::start(port, token, ctx.clone());
-                photo = photo.with_control(relay(rx, Persona::Photo, requested.clone(), ctx.clone()));
-                let rx = vector_control::start(port + 1, ctx.clone());
-                vector = vector.with_control(relay(rx, Persona::Vector, requested.clone(), ctx.clone()));
-                let rx = layout_control::start(port + 2, ctx.clone());
-                layout = layout.with_control(relay(rx, Persona::Layout, requested.clone(), ctx.clone()));
-                eprintln!("almanak: control channels: Photo {port}, Vector {}, Layout {}", port + 1, port + 2);
+                let rx = control_server::start(port, token.clone(), ctx.clone());
+                photo = photo.with_control(relay(rx, Persona::Photo, shared(), ctx.clone(), |r| r));
+                let rx = control_server::start(port + 1, token.clone(), ctx.clone());
+                let to_vector = |r: photocraft_ui_egui::ControlRequest| vectorcraft_ui_egui::ControlRequest { method: r.method, params: r.params, reply: r.reply };
+                vector = vector.with_control(relay(rx, Persona::Vector, shared(), ctx.clone(), to_vector)).with_automation_roots(vector_roots.clone());
+                if let Some(roots) = vector_roots {
+                    // Everywhere Vector doesn't say whose work it is (worker threads), the roots hold.
+                    file_access::confine_process(roots);
+                }
+                let rx = control_server::start(port + 2, token, ctx.clone());
+                let to_layout = |r: photocraft_ui_egui::ControlRequest| designcraft_ui_egui::ControlRequest { method: r.method, params: r.params, reply: r.reply };
+                layout = layout.with_control(relay(rx, Persona::Layout, shared(), ctx.clone(), to_layout));
             }
             let mut app = Almanak {
                 active: files.first().and_then(|f| Persona::for_path(f)).unwrap_or(Persona::Photo),
-                requested,
+                pending,
+                switch_request,
                 photo,
                 vector,
                 layout,
                 studio: studio::Studio::default(),
                 status: String::new(),
+                quitting_layout: None,
             };
             for f in &files {
                 app.open(f);
@@ -419,7 +589,7 @@ fn main() -> eframe::Result {
 
 #[cfg(test)]
 mod tests {
-    use super::Persona;
+    use super::{Persona, parse_args};
 
     #[test]
     fn files_open_in_the_persona_that_edits_them() {
@@ -428,5 +598,18 @@ mod tests {
         assert_eq!(Persona::for_path("x/y.vectorcraft"), Some(Persona::Vector));
         assert_eq!(Persona::for_path("mag.designcraft"), Some(Persona::Layout));
         assert_eq!(Persona::for_path("noext"), None);
+    }
+
+    #[test]
+    fn command_line() {
+        let parse = |v: &[&str]| parse_args(v.iter().map(|s| s.to_string()));
+        let a = parse(&["--control", "7979", "--control-token-file", "t", "a.psd", "--", "--odd.png"]).unwrap();
+        assert_eq!(a.control_port, Some(7979));
+        assert_eq!(a.files, ["a.psd", "--odd.png"]);
+        assert!(parse(&["--control", "0"]).is_err(), "port 0 would pick a random port for Photo only");
+        assert!(parse(&["--control", "65534"]).is_err(), "port + 2 must fit");
+        assert!(parse(&["--control"]).is_err());
+        assert!(parse(&["--control-token-file"]).is_err());
+        assert!(parse(&["--contrl", "7979"]).is_err(), "a mistyped option is not a file");
     }
 }

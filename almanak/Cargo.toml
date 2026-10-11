@@ -21,11 +21,13 @@ photocraft-automation = { path = "../photocraft/crates/automation" }
 photocraft-codecs = { path = "../photocraft/crates/codecs" }
 vectorcraft-ui-egui = { path = "../vectorcraft/crates/ui-egui" }
 vectorcraft-engine = { path = "../vectorcraft/crates/engine" }
+vectorcraft-doc = { path = "../vectorcraft/crates/doc" }
 vectorcraft-format = { path = "../vectorcraft/crates/format" }
 vectorcraft-pdf = { path = "../vectorcraft/crates/pdf" }
 designcraft-ui-egui = { path = "../designcraft/crates/ui-egui" }
 designcraft-engine = { path = "../designcraft/crates/engine" }
 designcraft-doc = { path = "../designcraft/crates/doc" }
+designcraft-geom = { path = "../designcraft/crates/geom" }
 designcraft-images = { path = "../designcraft/crates/images" }
 designcraft-render = { path = "../designcraft/crates/render" }
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "accesskit", "wayland", "x11"] }
