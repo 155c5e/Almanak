@@ -40,8 +40,26 @@ git subtree pull --prefix=designcraft https://github.com/storytold/designcraft m
 
 ## Agents
 
-PhotoCraft and VectorCraft ship MCP servers (`photocraft-cli mcp`, `vectorcraft-cli mcp`) that
-expose every command to agents; DesignCraft has one too. See each app's `docs/mcp.md`.
+`--control <port>` starts each app's own JSON-lines control server, unchanged, so each app's
+control protocol and MCP bridge work against Almanak as they do against the app:
+
+| Persona | Port | Protocol |
+|---|---|---|
+| Photo | `port` | [photocraft/docs/control-protocol.md](photocraft/docs/control-protocol.md) (token auth) |
+| Vector | `port + 1` | [vectorcraft/docs/control-protocol.md](vectorcraft/docs/control-protocol.md) |
+| Layout | `port + 2` | [designcraft/docs/control-protocol.md](designcraft/docs/control-protocol.md) |
+
+A request on a persona's port brings that persona to the front.
+
+```sh
+cargo run --release -- --control 7979 --control-token-file ~/.config/almanak/photo.token \
+  --automation-read-root ~/work --automation-write-root ~/work
+```
+
+Photo's file access over control is limited to the automation roots (none given: no file
+access). Its MCP bridge: `photocraft-cli mcp --bridge 127.0.0.1:7979 --control-token-file …`.
+PhotoCraft and VectorCraft also ship headless MCP servers (`photocraft-cli mcp`,
+`vectorcraft-cli mcp`); see each app's `docs/mcp.md`.
 
 ## Roadmap
 

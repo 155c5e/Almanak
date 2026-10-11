@@ -17,6 +17,8 @@ photocraft-engine = { path = "../photocraft/crates/engine" }
 photocraft-doc = { path = "../photocraft/crates/doc" }
 photocraft-io = { path = "../photocraft/crates/io" }
 photocraft-format = { path = "../photocraft/crates/format" }
+photocraft-automation = { path = "../photocraft/crates/automation" }
+photocraft-codecs = { path = "../photocraft/crates/codecs" }
 vectorcraft-ui-egui = { path = "../vectorcraft/crates/ui-egui" }
 vectorcraft-engine = { path = "../vectorcraft/crates/engine" }
 designcraft-ui-egui = { path = "../designcraft/crates/ui-egui" }

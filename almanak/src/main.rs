@@ -4,10 +4,25 @@
 //! Usage: `almanak [files…]`. Each file opens in the persona that edits its kind (`.psd`, `.png`
 //! → Photo; `.svg`, `.vectorcraft` → Vector; `.designcraft`, `.idml` → Layout).
 //!
+//! `--control <port>` starts each app's own JSON-lines control server, unchanged, so each app's
+//! MCP bridge and control docs apply: Photo on `port`, Vector on `port + 1`, Layout on `port + 2`.
+//! `--automation-read-root` / `--automation-write-root` name the folders agents may read and
+//! write (Photo; without them, no file access). Photo asks for a token (`--control-token-file <path>`, or one generated and printed). A request
+//! on a persona's port brings that persona to the front, so an agent sees what it drives.
+//!
 //! The three apps share one egui context: only the active persona runs its frame, and switching
 //! re-installs its fonts and theme (`reinstall_style`), which the others replaced.
 
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+#[path = "../../photocraft/apps/photocraft/src/control_server.rs"]
+mod photo_control;
+#[path = "../../vectorcraft/apps/vectorcraft/src/control_server.rs"]
+mod vector_control;
+#[path = "../../designcraft/apps/designcraft/src/control_server.rs"]
+mod layout_control;
 
 use photocraft_ui_egui::{FileDialogAnswer, FileDialogRequest, PhotocraftApp};
 use vectorcraft_ui_egui::VectorcraftApp;
@@ -42,8 +57,13 @@ impl Persona {
     }
 }
 
+/// No persona asked for by the control channel.
+const NO_REQUEST: u8 = u8::MAX;
+
 struct Almanak {
     active: Persona,
+    /// The persona a control request last arrived for (its index in [`Persona::ALL`]).
+    requested: Arc<AtomicU8>,
     photo: PhotocraftApp,
     vector: VectorcraftApp,
     layout: DesignApp,
@@ -97,6 +117,9 @@ impl Almanak {
 
 impl eframe::App for Almanak {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if let Some(&p) = Persona::ALL.get(self.requested.swap(NO_REQUEST, Ordering::Relaxed) as usize) {
+            self.switch(p, ctx);
+        }
         // ponytail: only the active persona runs; background jobs of the others wait until shown.
         match self.active {
             Persona::Photo => eframe::App::logic(&mut self.photo, ctx, frame),
@@ -123,7 +146,25 @@ impl eframe::App for Almanak {
     }
 }
 
-fn photo_services() -> photocraft_ui_egui::Services {
+/// Hand requests from `rx` to the app through the returned receiver, asking for `persona` first.
+fn relay<T: Send + 'static>(rx: std::sync::mpsc::Receiver<T>, persona: Persona, requested: Arc<AtomicU8>, ctx: egui::Context) -> std::sync::mpsc::Receiver<T> {
+    let (tx, out) = std::sync::mpsc::channel();
+    let index = Persona::ALL.iter().position(|p| *p == persona).unwrap_or(0) as u8;
+    std::thread::spawn(move || {
+        for request in rx {
+            requested.store(index, Ordering::Relaxed);
+            if tx.send(request).is_err() {
+                break;
+            }
+            ctx.request_repaint();
+        }
+    });
+    out
+}
+
+/// PhotoCraft's services; `automation` (the control channel's folders) lets agents read and write
+/// files there.
+fn photo_services(automation: Option<photocraft_automation::AuthorizedWorkspace>) -> photocraft_ui_egui::Services {
     use photocraft_ui_egui::{ExportSettings, jobs_ui::SaveCtl};
     fn export_options(s: &ExportSettings) -> photocraft_io::ExportOptions {
         let mut o = photocraft_io::ExportOptions::default();
@@ -139,6 +180,33 @@ fn photo_services() -> photocraft_ui_egui::Services {
         o.tga_bits = s.tga_bits;
         o
     }
+    let save_through = |write: Box<dyn Fn(&str, &[u8]) -> Result<(), String> + Send + Sync>| -> photocraft_ui_egui::SaveFileFn {
+        std::sync::Arc::new(move |doc: &photocraft_doc::Document, path: &str, s: &ExportSettings, ctl: &SaveCtl| {
+            ctl.progress(0.0, "Encoding");
+            let r = photocraft_io::export(doc, path, &export_options(s)).map_err(|e| e.to_string())?;
+            ctl.commit()?;
+            ctl.progress(0.0, "Writing");
+            write(path, &r.bytes)?;
+            Ok(r.warnings)
+        })
+    };
+    let automation_read = automation.clone().map(|w| {
+        Box::new(move |path: &str| {
+            let bytes = w.read(path).map_err(|e| e.to_string())?;
+            let name = Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or(path).to_string();
+            Ok((name, bytes))
+        }) as photocraft_ui_egui::AutomationReadFn
+    });
+    let automation_write = automation.clone().map(|w| {
+        Box::new(move |path: &str, bytes: &[u8]| w.write(path, bytes).map_err(|e| e.to_string())) as photocraft_ui_egui::AutomationWriteFn
+    });
+    let automation_save = automation.clone().map(|w| save_through(Box::new(move |p, b| w.write(p, b).map_err(|e| e.to_string()))));
+    let step: fn(&str, &serde_json::Value) -> photocraft_engine::Result<()> = photocraft_automation::workspace::authorize_desktop_engine_step;
+    let automation_command = automation.as_ref().map(|_| {
+        Box::new(|id: &str, params: &serde_json::Value| {
+            photocraft_automation::workspace::authorize_desktop_engine_command(id, params).map_err(|e| e.to_string())
+        }) as photocraft_ui_egui::AutomationCommandFn
+    });
     // ponytail: the essentials of PhotoCraft's native services (open, save, export, dialogs);
     // clipboard images, recovery, presets and the rest come with the shared-document work.
     photocraft_ui_egui::Services {
@@ -148,14 +216,12 @@ fn photo_services() -> photocraft_ui_egui::Services {
         export: Some(Box::new(|doc: &photocraft_doc::Document, path: &str, s: &ExportSettings| {
             photocraft_io::export(doc, path, &export_options(s)).map(|r| (r.bytes, r.warnings)).map_err(|e| e.to_string())
         })),
-        save_file: Some(std::sync::Arc::new(|doc: &photocraft_doc::Document, path: &str, s: &ExportSettings, ctl: &SaveCtl| {
-            ctl.progress(0.0, "Encoding");
-            let r = photocraft_io::export(doc, path, &export_options(s)).map_err(|e| e.to_string())?;
-            ctl.commit()?;
-            ctl.progress(0.0, "Writing");
-            photocraft_format::atomic_write(Path::new(path), &r.bytes).map_err(|e| e.to_string())?;
-            Ok(r.warnings)
-        })),
+        save_file: Some(save_through(Box::new(|p, b| photocraft_format::atomic_write(Path::new(p), b).map_err(|e| e.to_string())))),
+        automation_authorize: automation.is_some().then_some(step),
+        automation_read,
+        automation_write,
+        automation_save,
+        automation_command,
         write: Some(Box::new(|path: &str, bytes: &[u8]| photocraft_format::atomic_write(Path::new(path), bytes).map_err(|e| e.to_string()))),
         // Dialogs block, so they run on a thread of their own and answer through `reply`.
         file_dialog: Some(Box::new(|request, _parent, reply| {
@@ -186,6 +252,11 @@ fn photo_services() -> photocraft_ui_egui::Services {
                 };
                 reply.send(answer);
             });
+        })),
+        encode_png: Some(Box::new(|w, h, rgba| {
+            use photocraft_codecs::{ChannelLayout, EncodeOptions, Format, Image};
+            let img = Image::from_u8(w, h, ChannelLayout::Rgba, rgba.to_vec()).map_err(|e| e.to_string())?;
+            photocraft_codecs::encode(&img, Format::Png, &EncodeOptions::default()).map_err(|e| e.to_string())
         })),
         open_url: Some(Box::new(|url: &str| std::process::Command::new("xdg-open").arg(url).spawn().map(drop).map_err(|e| e.to_string()))),
         ..Default::default()
@@ -224,7 +295,54 @@ fn layout_services() -> designcraft_ui_egui::Services {
 }
 
 fn main() -> eframe::Result {
-    let files: Vec<String> = std::env::args().skip(1).collect();
+    let mut files = Vec::new();
+    let mut control_port: Option<u16> = None;
+    let mut token_file = None;
+    let (mut read_root, mut write_root) = (None, None);
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--control" => match args.next().and_then(|p| p.parse::<u16>().ok()).filter(|p| *p <= u16::MAX - 2) {
+                Some(p) => control_port = Some(p),
+                None => {
+                    eprintln!("almanak: --control needs a port number");
+                    std::process::exit(2);
+                }
+            },
+            "--control-token-file" => token_file = args.next().map(std::path::PathBuf::from),
+            "--automation-read-root" => read_root = args.next().map(std::path::PathBuf::from),
+            "--automation-write-root" => write_root = args.next().map(std::path::PathBuf::from),
+            _ => files.push(a),
+        }
+    }
+    // The folders agents may read and write through the control channel (none: no file access).
+    let workspace = match control_port.map(|_| photocraft_automation::AuthorizedWorkspace::new(read_root.as_deref(), write_root.as_deref())) {
+        Some(Ok(w)) => Some(w),
+        Some(Err(e)) => {
+            eprintln!("almanak: automation roots: {e}");
+            std::process::exit(2);
+        }
+        None => None,
+    };
+    let photo_token = match control_port {
+        Some(_) => {
+            let (supplied, file) = photocraft_automation::security::token_inputs(None, token_file);
+            match photocraft_automation::security::server_token(supplied.as_deref(), file.as_deref()) {
+                Ok(token) => {
+                    match &file {
+                        Some(path) => eprintln!("almanak: Photo control token file: {}", path.display()),
+                        None => eprintln!("almanak: Photo control token: {token}"),
+                    }
+                    Some(token)
+                }
+                Err(e) => {
+                    eprintln!("almanak: control token: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        None => None,
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Almanak")
@@ -238,15 +356,29 @@ fn main() -> eframe::Result {
         "Almanak",
         options,
         Box::new(move |cc| {
-            let mut photo = PhotocraftApp::new(photocraft_engine::Session::new(), photo_services());
+            let mut photo = PhotocraftApp::new(photocraft_engine::Session::new(), photo_services(workspace));
             if let Some(rs) = cc.wgpu_render_state.clone() {
                 photo.set_wgpu(rs);
             }
+            let mut vector = VectorcraftApp::new(vectorcraft_engine::Session::new(), vector_services());
+            let mut layout = DesignApp::new(designcraft_engine::Session::new(), layout_services());
+            let requested = Arc::new(AtomicU8::new(NO_REQUEST));
+            if let (Some(port), Some(token)) = (control_port, photo_token) {
+                let ctx = &cc.egui_ctx;
+                let rx = photo_control::start(port, token, ctx.clone());
+                photo = photo.with_control(relay(rx, Persona::Photo, requested.clone(), ctx.clone()));
+                let rx = vector_control::start(port + 1, ctx.clone());
+                vector = vector.with_control(relay(rx, Persona::Vector, requested.clone(), ctx.clone()));
+                let rx = layout_control::start(port + 2, ctx.clone());
+                layout = layout.with_control(relay(rx, Persona::Layout, requested.clone(), ctx.clone()));
+                eprintln!("almanak: control channels: Photo {port}, Vector {}, Layout {}", port + 1, port + 2);
+            }
             let mut app = Almanak {
                 active: files.first().and_then(|f| Persona::for_path(f)).unwrap_or(Persona::Photo),
+                requested,
                 photo,
-                vector: VectorcraftApp::new(vectorcraft_engine::Session::new(), vector_services()),
-                layout: DesignApp::new(designcraft_engine::Session::new(), layout_services()),
+                vector,
+                layout,
             };
             for f in &files {
                 app.open(f);
