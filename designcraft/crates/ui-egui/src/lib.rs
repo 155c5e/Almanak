@@ -1628,3 +1628,12 @@ mod browser_import_tests {
         assert!(app.session.doc().unwrap().doc.assets.is_empty());
     }
 }
+
+impl DesignApp {
+    /// Install the fonts and theme again from the next frame: Almanak hosts the apps in one egui
+    /// context and calls this when switching to this one, since the others replaced them.
+    pub fn reinstall_style(&mut self) {
+        self.styled = false;
+        self.fonts_ready = false;
+    }
+}
