@@ -3,7 +3,7 @@
 //!
 //! Conservative: anything whose effect can reach beyond the changed items' own bounds (styles,
 //! swatches, layers, parent pages, text wrap, effects, text that other stories show through
-//! cross-references, variables or footnote numbers) reports "everything" (`None`).
+//! cross-references, variables or footnote numbers, placed files) reports "everything" (`None`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,6 +33,9 @@ pub fn damage_with(old: &Document, new: &Document, cache: Option<&designcraft_co
         || old.spreads.len() != new.spreads.len()
         || old.parents.len() != new.parents.len()
         || old.parents.iter().zip(&new.parents).any(|(a, b)| !Arc::ptr_eq(a, b))
+        // A graphic's file replaced in place (Update Link, Relink) changes no item.
+        || old.assets.len() != new.assets.len()
+        || old.assets.values().zip(new.assets.values()).any(|(a, b)| !Arc::ptr_eq(a, b))
     {
         return None;
     }
@@ -205,6 +208,20 @@ mod tests {
         let dmg = damage(&old, &d).unwrap();
         assert!(dmg.iter().any(|(_, r)| r.contains(designcraft_geom::Point::new(100.0, 100.0))));
         assert!(dmg.iter().any(|(_, r)| r.contains(designcraft_geom::Point::new(350.0, 100.0))));
+    }
+
+    #[test]
+    fn replacing_a_placed_file_repaints() {
+        let mut d = Document::new(&NewDocument { pages: 1, ..Default::default() });
+        let id = designcraft_doc::AssetId(1);
+        let asset = designcraft_doc::Asset { id, name: "a.png".into(), mime: "image/png".into(), link: None, data: Arc::new(vec![1]), pixels: None, page: 0 };
+        d.assets.insert(id, Arc::new(asset));
+        let old = d.clone();
+        // Update Link: same items, new bytes.
+        if let Some(a) = d.assets.get_mut(&id) {
+            Arc::make_mut(a).data = Arc::new(vec![2]);
+        }
+        assert!(damage(&old, &d).is_none());
     }
 
     #[test]

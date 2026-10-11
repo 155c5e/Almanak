@@ -9,8 +9,8 @@ built from three open-source, pure-Rust apps by the [ArtCraft](https://getartcra
 | **Vector** | [VectorCraft](https://github.com/storytold/vectorcraft) | Vector illustration |
 | **Layout** | [DesignCraft](https://github.com/storytold/designcraft) | Page layout and publishing |
 
-> **Status: early.** The three apps run as personas of one window today. Editing the same
-> document across personas is the next milestone (see [Roadmap](#roadmap)).
+> **Status: early.** Photo, Vector and Layout personas in one window, with graphics placed in a
+> layout edited in place in Photo and Vector (StudioLink).
 
 ## Run
 
@@ -21,6 +21,18 @@ cargo run --release -- poster.psd logo.svg mag.designcraft   # each file opens i
 ```
 
 Needs Rust 1.95+. The first build compiles all three apps and takes a while.
+
+## One document, three personas
+
+The shared document is the layout's `.designcraft` file: it embeds every placed graphic.
+
+1. In **Layout**, select a placed graphic.
+2. Switch to **Photo** (raster images) or **Vector** (PDF, SVG): the graphic opens there.
+3. Edit it, then switch back to **Layout**: the edit is in the layout, as one undo step.
+
+Photo writes the graphic back as PSD (layers kept); Vector as PDF with Preserve Editing (the full
+VectorCraft document travels inside, so it reopens editable). Switching to the persona again
+with the same graphic selected returns to its open document.
 
 ## How it's put together
 
@@ -64,13 +76,16 @@ PhotoCraft and VectorCraft also ship headless MCP servers (`photocraft-cli mcp`,
 ## Roadmap
 
 1. ✅ Shell window with Photo / Vector / Layout personas.
-2. One `.craft` document: a layout whose placed images and artwork are embedded PhotoCraft and
-   VectorCraft documents, edited in place by switching persona (like Affinity's StudioLink).
+2. ✅ StudioLink: placed graphics edited in place in Photo and Vector. Next: Save in Photo/Vector
+   writes into the layout instead of asking for a file, live updates without switching, closing
+   an embedded graphic without a save prompt.
 3. Shared swatches, fonts and undo across personas; the apps' full native services
    (clipboard images, recovery, presets) in the shell.
 4. Blender objects: `.blend` files placed as 3D objects, rendered with headless Blender
    (`blender -b`), with Edit in Blender. Blender runs as a separate program only (it's GPL).
-5. Maybe: one layer model shared by all personas.
+5. Integrated terminal panel, for running Claude Code (or any agent) beside the document, wired to
+   the control channels.
+6. Maybe: one layer model shared by all personas.
 
 ## License
 

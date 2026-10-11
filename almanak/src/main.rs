@@ -17,6 +17,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
+mod studio;
+
 #[path = "../../photocraft/apps/photocraft/src/control_server.rs"]
 mod photo_control;
 #[path = "../../vectorcraft/apps/vectorcraft/src/control_server.rs"]
@@ -67,6 +69,10 @@ struct Almanak {
     photo: PhotocraftApp,
     vector: VectorcraftApp,
     layout: DesignApp,
+    /// Placed graphics being edited in Photo or Vector.
+    studio: studio::Studio,
+    /// The last StudioLink message, shown on the persona bar.
+    status: String,
 }
 
 /// The persona bar's height, in points.
@@ -76,6 +82,21 @@ impl Almanak {
     fn switch(&mut self, to: Persona, ctx: &egui::Context) {
         if to == self.active {
             return;
+        }
+        let result = match (self.active, to) {
+            (Persona::Layout, _) => self.studio.edit_selected(to, &self.layout, &mut self.photo, &mut self.vector),
+            (_, Persona::Layout) => self.studio.write_back(&mut self.layout, &self.photo, &self.vector).map(|n| {
+                (n > 0).then(|| format!("Updated {n} graphic{} in the layout", if n == 1 { "" } else { "s" }))
+            }),
+            _ => Ok(None),
+        };
+        match result {
+            Ok(Some(msg)) => self.status = msg,
+            Ok(None) => {}
+            Err(e) => {
+                log::error!("StudioLink: {e}");
+                self.status = format!("Couldn't link the graphic: {e}");
+            }
         }
         self.active = to;
         match to {
@@ -109,6 +130,10 @@ impl Almanak {
                     if ui.selectable_label(self.active == p, p.label()).clicked() {
                         self.switch(p, ui.ctx());
                     }
+                }
+                if !self.status.is_empty() {
+                    ui.separator();
+                    ui.weak(&self.status);
                 }
             });
         });
@@ -357,6 +382,8 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             let mut photo = PhotocraftApp::new(photocraft_engine::Session::new(), photo_services(workspace));
+            // Opens finish in the frame they start in, so StudioLink sees the opened document.
+            photo.background_jobs = false;
             if let Some(rs) = cc.wgpu_render_state.clone() {
                 photo.set_wgpu(rs);
             }
@@ -379,6 +406,8 @@ fn main() -> eframe::Result {
                 photo,
                 vector,
                 layout,
+                studio: studio::Studio::default(),
+                status: String::new(),
             };
             for f in &files {
                 app.open(f);

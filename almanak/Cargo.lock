@@ -185,7 +185,10 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 name = "almanak"
 version = "0.1.0"
 dependencies = [
+ "designcraft-doc",
  "designcraft-engine",
+ "designcraft-images",
+ "designcraft-render",
  "designcraft-ui-egui",
  "eframe",
  "egui",
@@ -200,6 +203,8 @@ dependencies = [
  "rfd",
  "serde_json",
  "vectorcraft-engine",
+ "vectorcraft-format",
+ "vectorcraft-pdf",
  "vectorcraft-ui-egui",
 ]
 
